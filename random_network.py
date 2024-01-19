@@ -14,8 +14,8 @@ class ExperimentParams:
     Construct this class and then change any parameters you want to change after construction
     """
     d_0: int = 100
-    d_mlp: int = 100
-    act_fn: Callable = t.nn.GELU() # can also use quadratic, relu...
+    d_mlp: int = 300
+    act_fn: Callable = t.nn.ReLU() # can also use quadratic, relu...
     weight_init_method: Callable = lambda w: t.nn.init.kaiming_normal_
     freeze: bool = True # whether to freeze the projection of the sparse boolean input vectors
     dataset_size: int = 300_000
@@ -26,7 +26,8 @@ class ExperimentParams:
     device: t.device = None
     n_plots: Optional[int] = 30
     n_prints: int = 20
-    loss_type: Literal["normal", "reweighted"] = "reweighted"
+    loss_type: Literal["normal", "reweighted"] = "normal"
+    operation: Literal["and", "xor"] = "xor"
 
     # These are computed from the above
     l: float = None
@@ -34,6 +35,7 @@ class ExperimentParams:
 
     def __post_init__(self):
         self.l = 2 * sqrt(log(self.d_0))
+        print(f"using E[l]: {self.l}")
         epsilon = log(self.d_mlp) / sqrt(self.d_mlp)
         self.epsilons = [epsilon * x for x in [0.1, 0.2, 0.5, 1]]
         self.device = t.device("cuda:0") if t.cuda.is_available() else t.device("cpu")
@@ -83,21 +85,37 @@ def get_pairwise_and(x: t.Tensor) -> t.Tensor:
     rows, cols = t.triu_indices(x.shape[1], x.shape[1], offset=1)
     return all_ands[:, rows, cols].reshape(x.shape[0], -1)
 
+def get_pairwise_xor(x: t.Tensor) -> t.Tensor:
+    """
+    x is a batch of sparse d_0-dim boolean vectors
+    """
+    all_xors = t.logical_xor(x.unsqueeze(2), x.unsqueeze(1)).float()
+    rows, cols = t.triu_indices(x.shape[1], x.shape[1], offset=1)
+    return all_xors[:, rows, cols].reshape(x.shape[0], -1)
 
-def u_and_loss(
-    x: t.Tensor, output: t.Tensor, p: int = 6, device: t.device = t.device("cpu")
+def get_expected(x: t.Tensor, operation: Literal["and", "xor"]) -> t.Tensor:
+    if operation == "and":
+        return get_pairwise_and(x)
+    elif operation == "xor":
+        return get_pairwise_xor(x)
+    else:
+        raise ValueError(f"Unknown operation: {operation}")
+
+def u_op_loss(
+    x: t.Tensor, output: t.Tensor, operation: Literal["and", "xor"], p: int = 6, device: t.device = t.device("cpu")
 ) -> t.Tensor:
     """
     x is a batch of sparse d_0-dim boolean vectors
     output is the predicted pairwise ands of all the entries of each vector (batch_size x d choose 2)
     """
-    expected = get_pairwise_and(x.cpu()).to(device)
+    expected = get_expected(x.cpu(), operation).to(device)
     return (output - expected).abs().pow(p).mean() ** (1 / p)
 
 
 def u_and_loss_reweighted(
     x: t.Tensor,
     output: t.Tensor,
+    operation: Literal["and", "xor"],
     p: int = 6,
     ones_weighting: float = 1.0,
     device: t.device = t.device("cpu"),
@@ -107,7 +125,7 @@ def u_and_loss_reweighted(
     output is the predicted pairwise ands of all the entries of each vector (batch_size x d choose 2)
     here we reweight the loss so that the loss on the ones is weighted by ones_weighting
     """
-    expected = get_pairwise_and(x.cpu()).to(device)
+    expected = get_expected(x.cpu(), operation).to(device)
     ones_mask = expected == 1
     zeros_mask = expected == 0
     n_ones = ones_mask.sum()
@@ -134,6 +152,7 @@ def test_accuracy(
     dataset_size: int,
     l: float,
     epsilons: List[float],
+    operation: Literal["and", "xor"],
     do_plot: bool = False,
     idx: int = 0,
     device: t.device = t.device("cpu"),
@@ -143,7 +162,7 @@ def test_accuracy(
     data = gen_data(net.linear1.in_features, p_on, dataset_size)
     data = data.to(device)
     output = net(data)
-    expected = get_pairwise_and(data.cpu()).to(device)
+    expected = get_expected(data.cpu(), operation).to(device)
 
     mask = expected == 0
     n_zeros = mask.sum()
@@ -166,6 +185,7 @@ def test_accuracy(
         plt.hist(sample(zero_errors, k=len(one_errors)), bins=n_hist_bins, alpha=0.5, label="zeros", color="blue")
         plt.xlim([0, 1.3])
         plt.legend()
+        plt.title(f"errors for {operation}")
         plt.savefig(f"hist_{idx}.png")
         plt.close()
 
@@ -197,6 +217,7 @@ def train(
     device: t.device,
     loss_p: int,
     loss_type: Literal["normal", "reweighted"],
+    operation: Literal["and", "xor"],
 ):
     """
     net: the network to train
@@ -210,6 +231,7 @@ def train(
     n_prints: how many times to print the loss and accuracy during training
     device: device to use for training
     loss_p: p to use for the loss function
+    operation: which operation to use for the loss function
     """
     mean, var = get_param_mean_var(net)
     print(f"linear1 weights - mean: {mean}, var: {var}")
@@ -228,18 +250,18 @@ def train(
         batch = data[i : i + batch_size].to(device)
         optim.zero_grad()
         if loss_type == "normal":
-            loss = u_and_loss(batch, net(batch), device=device, p=loss_p)
+            loss = u_op_loss(x=batch, output=net(batch), operation=operation, device=device, p=loss_p)
         elif loss_type == "reweighted":
-            loss = u_and_loss_reweighted(batch, net(batch), device=device, p=loss_p)
+            loss = u_and_loss_reweighted(x=batch, output=net(batch), operation=operation, device=device, p=loss_p)
         if batch_idx % print_every == 0:
             print(f"loss: {loss.item()}")
-            print(test_accuracy(net, test_dataset_size, l, epsilons, device=device))
+            print(test_accuracy(net=net, dataset_size=test_dataset_size, l=l, epsilons=epsilons, operation=operation, device=device))
         if plot_every is not None:
             if batch_idx % plot_every == 0:
-                test_accuracy(net, test_dataset_size, l, epsilons, do_plot=True, idx=i, device=device)
+                test_accuracy(net=net, dataset_size=test_dataset_size, l=l, epsilons=epsilons, do_plot=True, idx=i, operation=operation, device=device)
         loss.backward()
         optim.step()
-    print(test_accuracy(net, test_dataset_size, l, epsilons, device=device))
+    print(test_accuracy(net=net, dataset_size=test_dataset_size, l=l, epsilons=epsilons, operation=operation, device=device))
     mean, var = get_param_mean_var(net)
     print(f"linear1 weights - mean: {mean}, var: {var}")
 
@@ -266,6 +288,7 @@ def experiment(params: ExperimentParams):
         device=params.device,
         loss_p=params.loss_p,
         loss_type=params.loss_type,
+        operation=params.operation,
     )
 
 
