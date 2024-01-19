@@ -1,15 +1,56 @@
-from typing import Callable, Any, List
+from typing import Callable, Any, List, Literal, Tuple, Optional
 import torch as t
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from math import sqrt, log
+from dataclasses import dataclass
+from random import sample
+
+@dataclass
+class ExperimentParams:
+    """
+    All the parameters for the experiment
+    The default values should be sensible defaults
+    Construct this class and then change any parameters you want to change after construction
+    """
+    d_0: int = 100
+    d_mlp: int = 100
+    act_fn: Callable = t.nn.GELU() # can also use quadratic, relu...
+    weight_init_method: Callable = lambda w: t.nn.init.kaiming_normal_
+    freeze: bool = True # whether to freeze the projection of the sparse boolean input vectors
+    dataset_size: int = 300_000
+    batch_size: int = 100
+    lr: float = 1e-3
+    test_dataset_size: int = 1000
+    loss_p: int = 2
+    device: t.device = None
+    n_plots: Optional[int] = 30
+    n_prints: int = 20
+    loss_type: Literal["normal", "reweighted"] = "reweighted"
+
+    # These are computed from the above
+    l: float = None
+    epsilons: List[float] = None
+
+    def __post_init__(self):
+        self.l = 2 * sqrt(log(self.d_0))
+        epsilon = log(self.d_mlp) / sqrt(self.d_mlp)
+        self.epsilons = [epsilon * x for x in [0.1, 0.2, 0.5, 1]]
+        self.device = t.device("cuda:0") if t.cuda.is_available() else t.device("cpu")
+
 
 class Net(t.nn.Module):
-
-    def __init__(self, d_0, d_mlp, act_fn: Callable, weight_init_method: Callable = t.nn.init.kaiming_uniform_, freeze_first_layer: bool = True):
+    def __init__(
+        self,
+        d_0: int,
+        d_mlp: int,
+        act_fn: Callable,
+        weight_init_method: Callable = t.nn.init.kaiming_uniform_,
+        freeze_first_layer: bool = True,
+    ):
         super().__init__()
         self.linear1 = t.nn.Linear(d_0, d_mlp)
-        self.linear2 = t.nn.Linear(d_mlp, (d_0 * (d_0 -1))//2)
+        self.linear2 = t.nn.Linear(d_mlp, (d_0 * (d_0 - 1)) // 2)
         self.act_fn = act_fn
         self.freeze_first_layer = freeze_first_layer
 
@@ -24,42 +65,80 @@ class Net(t.nn.Module):
         return self.linear2(self.act_fn(self.linear1(x)))
 
 
-def get_pairwise_and(x):
+def get_param_mean_var(net: Net) -> Tuple[float]:
+    linear_1_params = (
+        t.nn.utils.parameters_to_vector(net.linear1.parameters())
+        .detach()
+        .cpu()
+        .flatten()
+    )
+    return linear_1_params.mean().item(), linear_1_params.std().item()
+
+
+def get_pairwise_and(x: t.Tensor) -> t.Tensor:
     """
-    x is a batch of sparse d-dim boolean vectors
+    x is a batch of sparse d_0-dim boolean vectors
     """
-    all_ands = t.einsum('bi,bj->bij', x, x)
+    all_ands = t.einsum("bi,bj->bij", x, x)
     rows, cols = t.triu_indices(x.shape[1], x.shape[1], offset=1)
     return all_ands[:, rows, cols].reshape(x.shape[0], -1)
 
-def u_and_loss(x, output, p=6, device: t.device = t.device("cpu")) -> float:
-    """
-    x is a batch of sparse d-dim boolean vectors
-    output is the pairwise ands of all the entries of each vector (batch times d choose 2 dim)
-    """
-    expected = get_pairwise_and(x.cpu()).to(device)
-    return (output - expected).abs().pow(p).mean() ** (1/p)
 
-def u_and_loss_reweighted(x, output, p=6, ones_weighting: float = 1.0, device: t.device = t.device("cpu")) -> float:
+def u_and_loss(
+    x: t.Tensor, output: t.Tensor, p: int = 6, device: t.device = t.device("cpu")
+) -> t.Tensor:
     """
-    x is a batch of sparse d-dim boolean vectors
-    output is the pairwise ands of all the entries of each vector (batch times d choose 2 dim)
+    x is a batch of sparse d_0-dim boolean vectors
+    output is the predicted pairwise ands of all the entries of each vector (batch_size x d choose 2)
     """
     expected = get_pairwise_and(x.cpu()).to(device)
-    ones_loss = ((output[expected==1] - 1).abs().pow(p).sum() / (expected==1).sum()) ** (1/p)
-    zeros_loss = ((output[expected==0]).abs().pow(p).sum() / (expected==0).sum()) ** (1/p)
+    return (output - expected).abs().pow(p).mean() ** (1 / p)
+
+
+def u_and_loss_reweighted(
+    x: t.Tensor,
+    output: t.Tensor,
+    p: int = 6,
+    ones_weighting: float = 1.0,
+    device: t.device = t.device("cpu"),
+) -> t.Tensor:
+    """
+    x is a batch of sparse d_0-dim boolean vectors
+    output is the predicted pairwise ands of all the entries of each vector (batch_size x d choose 2)
+    here we reweight the loss so that the loss on the ones is weighted by ones_weighting
+    """
+    expected = get_pairwise_and(x.cpu()).to(device)
+    ones_mask = expected == 1
+    zeros_mask = expected == 0
+    n_ones = ones_mask.sum()
+    n_zeros = zeros_mask.sum()
+    ones_loss = ((output[ones_mask] - 1).abs().pow(p).sum() / n_ones) ** (1 / p)
+    zeros_loss = ((output[zeros_mask]).abs().pow(p).sum() / n_zeros) ** (1 / p)
     loss = ones_weighting * ones_loss + zeros_loss
     if loss < 0:
-        raise ValueError(f"Loss is negative: {loss}, ones_loss: {ones_loss}, zeros_loss: {zeros_loss}, expected sum {expected.sum()}")
+        raise ValueError(
+            f"Loss is negative: {loss}, ones_loss: {ones_loss}, zeros_loss: {zeros_loss}, expected.sum() {expected.sum()}"
+        )
     return loss
 
-def gen_data(d_0: int, p_on: float, dataset_size: int):
+
+def gen_data(d_0: int, p_on: float, dataset_size: int) -> t.Tensor:
     """
     Generates a batch of sparse d-dim boolean vectors
     """
     return (t.rand(dataset_size, d_0) < p_on).float()
 
-def test_accuracy(net, dataset_size, l: float, epsilons: List[float], do_plot: bool = False, idx: int = 0, device: t.device = t.device("cpu")) -> float:
+
+def test_accuracy(
+    net: Net,
+    dataset_size: int,
+    l: float,
+    epsilons: List[float],
+    do_plot: bool = False,
+    idx: int = 0,
+    device: t.device = t.device("cpu"),
+    n_hist_bins: int = 100,
+) -> float:
     p_on = l / net.linear1.in_features
     data = gen_data(net.linear1.in_features, p_on, dataset_size)
     data = data.to(device)
@@ -67,19 +146,26 @@ def test_accuracy(net, dataset_size, l: float, epsilons: List[float], do_plot: b
     expected = get_pairwise_and(data.cpu()).to(device)
 
     mask = expected == 0
-    mask_ones = output * mask 
-    means_at_zeros = mask_ones.sum() / mask.sum()
-    std_at_zeros = ((mask_ones - means_at_zeros) * mask).pow(2).sum().sqrt() / mask.sum().sqrt()
+    n_zeros = mask.sum()
+    means_at_zeros = (output * mask).sum() / n_zeros
+    std_at_zeros = (((output - means_at_zeros) * mask).pow(2).sum() / n_zeros).sqrt()
 
     mask = expected == 1
-    mask_zeros = output * mask
-    means_at_ones = mask_zeros.sum() / mask.sum()
-    std_at_ones = ((mask_zeros - means_at_ones) * mask).pow(2).sum().sqrt() / mask.sum().sqrt()
+    n_ones = mask.sum()
+    means_at_ones = (output * mask).sum() / n_ones
+    std_at_ones = (((output - means_at_ones) * mask).pow(2).sum() / n_ones).sqrt()
 
     all_errors = (output - expected).abs().flatten()
-    # Save histogram plot of errors
+
+    one_errors = all_errors[expected.flatten() == 1].detach().cpu().numpy().tolist()
+    zero_errors = all_errors[expected.flatten() == 0].detach().cpu().numpy().tolist()
+
     if do_plot:
-        plt.hist(all_errors.detach().cpu().numpy(), bins=100)
+        # Save histogram plot of errors
+        plt.hist(one_errors, bins=n_hist_bins, alpha=0.5, label="ones", color="orange")
+        plt.hist(sample(zero_errors, k=len(one_errors)), bins=n_hist_bins, alpha=0.5, label="zeros", color="blue")
+        plt.xlim([0, 1.3])
+        plt.legend()
         plt.savefig(f"hist_{idx}.png")
         plt.close()
 
@@ -91,59 +177,98 @@ def test_accuracy(net, dataset_size, l: float, epsilons: List[float], do_plot: b
         "mean_errors": all_errors.mean().item(),
         "std_errors": all_errors.std().item(),
         **{
-            f"{round(epsilon, 4)}_acc":  all_errors.lt(epsilon).sum().item() / output.numel() for epsilon in epsilons
-        }
+            f"{round(epsilon, 4)}_acc": all_errors.lt(epsilon).sum().item()
+            / output.numel()
+            for epsilon in epsilons
+        },
     }
-    
-def train(net, dataset_size, batch_size, l: float, lr=1e-3, test_dataset_size: int = 100, epsilons: List[float] = [0.1], n_plots = 10, device: t.device = t.device("cpu"), loss_p: int = 6):
+
+
+def train(
+    net: Net,
+    dataset_size: int,
+    batch_size: int,
+    l: float,
+    lr: float,
+    test_dataset_size: int,
+    epsilons: List[float],
+    n_plots: Optional[int],
+    n_prints: int,
+    device: t.device,
+    loss_p: int,
+    loss_type: Literal["normal", "reweighted"],
+):
+    """
+    net: the network to train
+    dataset_size: how many random sparse boolean examples to train on
+    batch_size: batch size to use for training
+    l: expected number of ones in each sparse boolean vector
+    lr: learning rate for SGD
+    test_dataset_size: how many random sparse boolean examples to use for testing
+    epsilons: list of epsilons to track for accuracy calculation
+    n_plots: how many histogram plots to make of the error size during training
+    n_prints: how many times to print the loss and accuracy during training
+    device: device to use for training
+    loss_p: p to use for the loss function
+    """
+    mean, var = get_param_mean_var(net)
+    print(f"linear1 weights - mean: {mean}, var: {var}")
     net.train()
     optim = t.optim.Adam(net.parameters(), lr=lr)
     p_on = l / net.linear1.in_features
     data = gen_data(net.linear1.in_features, p_on, dataset_size)
     data = data.to(device)
-
-    plot_every = (dataset_size / batch_size) // n_plots
-    for batch_idx in tqdm(range(0, dataset_size//batch_size)):
+    if n_plots is None:
+        plot_every = None
+    else:
+        plot_every = (dataset_size / batch_size) // n_plots
+    print_every = (dataset_size / batch_size) // n_prints
+    for batch_idx in tqdm(range(0, dataset_size // batch_size)):
         i = batch_idx * batch_size
-        batch = data[i:i+batch_size].to(device)
+        batch = data[i : i + batch_size].to(device)
         optim.zero_grad()
-        loss = u_and_loss_reweighted(batch, net(batch), device=device, p=loss_p)
-        if batch_idx % 300 == 0:
+        if loss_type == "normal":
+            loss = u_and_loss(batch, net(batch), device=device, p=loss_p)
+        elif loss_type == "reweighted":
+            loss = u_and_loss_reweighted(batch, net(batch), device=device, p=loss_p)
+        if batch_idx % print_every == 0:
             print(f"loss: {loss.item()}")
             print(test_accuracy(net, test_dataset_size, l, epsilons, device=device))
-        # if batch_idx % plot_every == 0:
-        #     test_accuracy(net, test_dataset_size, l, epsilons, do_plot=True, idx=i, device=device)
+        if plot_every is not None:
+            if batch_idx % plot_every == 0:
+                test_accuracy(net, test_dataset_size, l, epsilons, do_plot=True, idx=i, device=device)
         loss.backward()
         optim.step()
-
     print(test_accuracy(net, test_dataset_size, l, epsilons, device=device))
+    mean, var = get_param_mean_var(net)
+    print(f"linear1 weights - mean: {mean}, var: {var}")
 
+
+def experiment(params: ExperimentParams):
+    net = Net(
+        d_0=params.d_0,
+        d_mlp=params.d_mlp,
+        act_fn=params.act_fn,
+        weight_init_method=params.weight_init_method,
+        freeze_first_layer=params.freeze,
+    )
+    net = net.to(params.device)
+    train(
+        net=net,
+        dataset_size=params.dataset_size,
+        batch_size=params.batch_size,
+        l=params.l,
+        lr=params.lr,
+        test_dataset_size=params.test_dataset_size,
+        epsilons=params.epsilons,
+        n_plots=params.n_plots,
+        n_prints=params.n_prints,
+        device=params.device,
+        loss_p=params.loss_p,
+        loss_type=params.loss_type,
+    )
 
 
 if __name__ == "__main__":
-    d_0 = 100
-    d_mlp = 300
-    act_fn = t.nn.ReLU()
-    weight_init_method = t.nn.init.kaiming_normal_
-    freeze = False
-    net = Net(d_0, d_mlp, act_fn, weight_init_method, freeze_first_layer=freeze)
-    dataset_size = 1_000_000
-    batch_size = 100
-    # l = sqrt(log(d_0))
-    l = 4
-    lr=1e-3
-    test_dataset_size=1000
-    epsilon = log(d_mlp) / sqrt(d_mlp)
-    epsilons = [epsilon*x for x in [0.1, 0.3, 1]]
-    loss_p = 7
-    device = t.device("cuda:0") if t.cuda.is_available() else t.device("cpu")
-    net = net.to(device)
-    train(net, dataset_size, batch_size, l, lr, test_dataset_size, epsilons, device=device, loss_p=loss_p)
-
-
-
-    
-    
-    
-
-
+    params = ExperimentParams()
+    experiment(params)
